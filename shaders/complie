@@ -1,0 +1,2 @@
+/Users/halforange/Documents/library/VulkanSDK/macOS/bin/glslc shader.vert -o vert.spv
+/Users/halforange/Documents/library/VulkanSDK/macOS/bin/glslc shader.frag -o frag.spv
