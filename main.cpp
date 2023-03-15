@@ -1,5 +1,9 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
+#define GLM_FORCE_RADIANS // 使rotate等函数可以使角度转弧度
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp> // 包含了rotate、lookAt、perspective等函数
+#include <chrono> // 计时用
 #include <iostream> // 用于输出信息
 #include <stdexcept> // 用于报告错误
 #include <cstdlib> // 用于提供 EXIT_SUCCESS 和 EXIT_FAILURE 宏
@@ -12,11 +16,75 @@
 #include <limits> // 用于提供 std::numeric_limits
 #include <algorithm> // 用于提供 std::clamp
 #include <fstream> // 用于读取文件
+#include <array>
 
 const uint32_t WIDTH = 800;// 窗口的宽和高
 const uint32_t HEIGHT = 600;
 
-const int MAX_FRAMES_IN_FLIGHT = 2;// 表明同时可以处理多少帧
+// 顶点位置和颜色
+struct Vertex {
+    glm::vec2 pos;
+    glm::vec3 color;
+
+    //数据绑定描述，描述数据的格式
+    static VkVertexInputBindingDescription getBindingDescription() {
+        VkVertexInputBindingDescription bindingDescription{};
+        bindingDescription.binding = 0;// 绑定的索引
+        bindingDescription.stride = sizeof(Vertex);// stride表示一个数据条目的步长（字节数）
+        // VK_VERTEX_INPUT_RATE_VERTEX: 移动到每个顶点之后的下一个数据条目
+        // VK_VERTEX_INPUT_RATE_INSTANCE: 移动到每个实例之后的下一个数据条目
+        bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;// 不使用实例化渲染，所以使用顶点
+
+        return bindingDescription;
+    }
+
+    // 属性描述，描述如何从源自绑定描述的顶点数据块中提取顶点属性
+    static std::array<VkVertexInputAttributeDescription, 2> getAttributeDescriptions() {
+        // 我们有两个属性：位置和颜色，所以我们需要两个属性描述结构
+        std::array<VkVertexInputAttributeDescription, 2> attributeDescriptions{};
+        // 顶点属性描述
+        attributeDescriptions[0].binding = 0;// 顶点数据来自哪个绑定
+        attributeDescriptions[0].location = 0;// 顶点着色器中输入的位置指令
+        // format表示数据类型，有以下几种：
+        // float: VK_FORMAT_R32_SFLOAT  ;  vec2: VK_FORMAT_R32G32_SFLOAT
+        // vec3: VK_FORMAT_R32G32B32_SFLOAT  ;  vec4: VK_FORMAT_R32G32B32A32_SFLOAT
+        attributeDescriptions[0].format = VK_FORMAT_R32G32_SFLOAT;// 这里使用vec2
+        attributeDescriptions[0].offset = offsetof(Vertex, pos);// 偏移，这里offsetof(a,b)会自动计算类a中的成员b的偏移量
+
+        // 颜色属性描述
+        attributeDescriptions[1].binding = 0;
+        attributeDescriptions[1].location = 1;
+        attributeDescriptions[1].format = VK_FORMAT_R32G32B32_SFLOAT;// vec3
+        attributeDescriptions[1].offset = offsetof(Vertex, color);
+
+        return attributeDescriptions;
+    }
+};
+
+// 顶点数据，包括位置和颜色
+const std::vector<Vertex> vertices = {
+    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}},
+    {{0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}},
+    {{0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},
+    {{-0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}}
+};
+
+// 顶点索引
+const std::vector<uint16_t> indices = {
+    0, 1, 2, 2, 3, 0
+};
+
+// Uniform对象（模型、视角、投影矩阵）
+// 注意，Vulkan规定传入shader的uniform的数据偏移必须对齐：vec2对应8字节，vec3、vec4、mat4对应16字节
+// 这里我们可以定义GLM_FORCE_DEFAULT_ALIGNED_GENTYPES，他可以帮我们自动对齐glm参数，但是不能帮我们对齐嵌套数据，到时还是得用alignas(16)手动对齐
+// 为了防止出现对齐问题，我们直接对每个值都手动增加偏移对齐，就没有以上麻烦了，一劳永逸
+struct UniformBufferObject {
+    alignas(16) glm::mat4 model;
+    alignas(16) glm::mat4 view;
+    alignas(16) glm::mat4 proj;
+};
+
+const int MAX_FRAMES_IN_FLIGHT = 2;// 表明可以同时处理多少帧
 
 // validationLayers存储了所有申请的验证层，通过指定其名称来启用，这里启用了LunarG提供的标准验证层（类似于STL）
 const std::vector<const char*> validationLayers = {
@@ -100,15 +168,28 @@ private:
     VkFormat swapChainImageFormat;// 交换链图像的格式
     VkExtent2D swapChainExtent;// 交换链图像的范围
     std::vector<VkImageView> swapChainImageViews;// 图像视图
+    std::vector<VkFramebuffer> swapChainFramebuffers;// 帧缓冲
 
     VkRenderPass renderPass;// 渲染通道
+    VkDescriptorSetLayout descriptorSetLayout;// 描述符布局，即uniform值
     VkPipelineLayout pipelineLayout;// 管道布局，用来指定shader中的uniform值
     VkPipeline graphicsPipeline;// 图形管道
 
-    std::vector<VkFramebuffer> swapChainFramebuffers;// 帧缓冲
-
     VkCommandPool commandPool;// 命令池
     std::vector<VkCommandBuffer> commandBuffers;// 命令缓冲，其与命令池绑定，命令池删除，它也会被删除（一帧对应一个缓冲，多帧即为数组）
+
+    VkBuffer vertexBuffer;// 顶点缓冲区
+    VkDeviceMemory vertexBufferMemory;// 顶点缓冲内存
+    VkBuffer indexBuffer;// 顶点索引缓冲
+    VkDeviceMemory indexBufferMemory;// 顶点索引缓冲内存
+
+    // uniform缓冲的个数与同时处理的帧数相同（因为uniform本就是逐帧修改的，与帧要一一对应）
+    std::vector<VkBuffer> uniformBuffers;// uniform缓冲
+    std::vector<VkDeviceMemory> uniformBuffersMemory;// uniform缓冲内存
+    std::vector<void*> uniformBuffersMapped;// 缓冲区映射
+
+    VkDescriptorPool descriptorPool;// 描述符池
+    std::vector<VkDescriptorSet> descriptorSets;// 描述符集
 
     // 创建同步对象
     std::vector<VkSemaphore> imageAvailableSemaphores;// 信号量：表示已经从交换链中获取了图像并准备好渲染（一帧对应一个信号量，多帧即为数组）
@@ -152,9 +233,15 @@ private:
         createSwapChain();// 创建交换链
         createImageViews();// 创建图像视图
         createRenderPass();// 渲染通道
+        createDescriptorSetLayout();// 创建描述符布局，因为要在创建图形管线时调用，所以要在之前创建
         createGraphicsPipeline();// 创建图形管线
         createFramebuffers();// 创建帧缓冲
         createCommandPool();// 创建命令池
+        createVertexBuffer();// 创建顶点缓冲
+        createIndexBuffer();// 创建顶点索引缓冲
+        createUniformBuffers();// 创建uniform缓冲
+        createDescriptorPool();// 创建描述符池
+        createDescriptorSets();// 创建描述符集
         createCommandBuffers();// 创建命令缓冲
         createSyncObjects();// 创建同步对象
     }
@@ -174,6 +261,22 @@ private:
     // 创建和删除的顺序满足：先创建的后删除，后创建的先删除
     void cleanup() {
         cleanupSwapChain();// 删除交换链，以及与之绑定的交换链图像视图和交换链帧缓冲
+
+        // 删除uniform缓冲，释放其内存
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            vkDestroyBuffer(device, uniformBuffers[i], nullptr);
+            vkFreeMemory(device, uniformBuffersMemory[i], nullptr);
+        }
+
+        vkDestroyDescriptorPool(device, descriptorPool, nullptr);// 删除描述符池，与其绑定的描述符集也会随之删除
+
+        vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);// 删除描述符布局
+
+        vkDestroyBuffer(device, indexBuffer, nullptr);// 删除顶点索引缓冲
+        vkFreeMemory(device, indexBufferMemory, nullptr);// 释放顶点索引缓冲的内存
+
+        vkDestroyBuffer(device, vertexBuffer, nullptr);// 删除顶点缓冲
+        vkFreeMemory(device, vertexBufferMemory, nullptr);// 释放顶点缓冲的内存
 
         vkDestroyPipeline(device, graphicsPipeline, nullptr);// 删除图形管道
         vkDestroyPipelineLayout(device, pipelineLayout, nullptr);// 删除管道布局
@@ -798,10 +901,15 @@ private:
         // 描述传输给顶点着色器的顶点数据的格式，例如每个顶点的数据间隔，数据是顶点坐标还是实例，偏移量等等
         VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
         vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vertexInputInfo.vertexBindingDescriptionCount = 0;
-        vertexInputInfo.pVertexBindingDescriptions = nullptr; // Optional
-        vertexInputInfo.vertexAttributeDescriptionCount = 0;
-        vertexInputInfo.pVertexAttributeDescriptions = nullptr; // Optional
+
+        // 获得数据绑定描述和数据属性描述
+        auto bindingDescription = Vertex::getBindingDescription();
+        auto attributeDescriptions = Vertex::getAttributeDescriptions();
+
+        vertexInputInfo.vertexBindingDescriptionCount = 1;// 绑定描述数量
+        vertexInputInfo.pVertexBindingDescriptions = &bindingDescription;
+        vertexInputInfo.vertexAttributeDescriptionCount = static_cast<uint32_t>(attributeDescriptions.size());// 属性描述数量
+        vertexInputInfo.pVertexAttributeDescriptions = attributeDescriptions.data();
 
         // 指定将从顶点绘制什么样的几何形状（点，线，条带线，面，条带面）以及是否应启用primitiveRestartEnable（高级设置，可以执行重用顶点等）
         VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
@@ -835,7 +943,7 @@ private:
         rasterizer.polygonMode = VK_POLYGON_MODE_FILL;// 此项决定几何形状，只有三种：点POINT、线LINE、面FILL，除了面不需要启用GPU feature，其他都要
         rasterizer.lineWidth = 1.0f;// 线宽，其最大值取决于其硬件，设置大于1.0f的线需要启用名为"wideLines"的GPU feature
         rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;// 面剔除，有四种：禁用剔除，剔除正面、剔除背面、剔除正面和背面
-        rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;// 指定面的正反与点的顺序之间的关系，这里指定顺时针为正面（逆时针为COUNTER_CLOCKWISE）
+        rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;// 指定面的正反与点的顺序之间的关系，这里指定逆时针为正面
         rasterizer.depthBiasEnable = VK_FALSE;// 通过面片斜率或者固定值来更改深度值，这里我们不修改
         rasterizer.depthBiasConstantFactor = 0.0f; // Optional
         rasterizer.depthBiasClamp = 0.0f; // Optional
@@ -874,11 +982,11 @@ private:
         colorBlending.blendConstants[2] = 0.0f; // Optional
         colorBlending.blendConstants[3] = 0.0f; // Optional
 
-        // 管道布局，用来指定shader中的uniform值（类似于shader中的可以动态改变的全局变量），目前先不指定
+        // 管道布局，用来指定shader中的uniform值（类似于shader中的可以动态改变的全局变量）
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
         pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pipelineLayoutInfo.setLayoutCount = 0; // Optional
-        pipelineLayoutInfo.pSetLayouts = nullptr; // Optional
+        pipelineLayoutInfo.setLayoutCount = 1;
+        pipelineLayoutInfo.pSetLayouts = &descriptorSetLayout;// 将描述符与管道绑定
         pipelineLayoutInfo.pushConstantRangeCount = 0; // Optional
         pipelineLayoutInfo.pPushConstantRanges = nullptr; // Optional
 
@@ -1116,9 +1224,6 @@ private:
         // VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS: 渲染传递命令将从辅助命令缓冲区执行
         vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 
-        // 绑定图形管线，函数第二个参数指定管线对象是图形管线还是计算管线
-        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
-
         // 指定视口和裁剪矩阵的大小
         VkViewport viewport{};
         viewport.x = 0.0f;
@@ -1134,8 +1239,23 @@ private:
         scissor.extent = swapChainExtent;
         vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
+        // 绑定图形管线，函数第二个参数指定管线对象是图形管线还是计算管线
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
+
+        VkBuffer vertexBuffers[] = {vertexBuffer};
+        VkDeviceSize offsets[] = {0};
+        // 绑定顶点缓冲
+        vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
+        // 绑定顶点索引缓冲
+        vkCmdBindIndexBuffer(commandBuffer, indexBuffer, 0, VK_INDEX_TYPE_UINT16);// 由于索引的数据类型为UINT16，所以这里匹配
+
         // 绘制命令，函数结构：（命令缓冲，顶点数量，实例数量，顶点缓冲的偏移量，实例的偏移量）
-        vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+        //vkCmdDraw(commandBuffer, static_cast<uint32_t>(vertices.size()), 1, 0, 0);
+
+        // 绘制之前将更新过的描述符集（它每帧都会修改）进行绑定，函数结构：绑定描述符集(命令缓冲, 绑定到哪个管道, 描述符基于的布局, 第一个描述符集的索引, 绑定的集数, 集的数组, 动态描述符的偏移量数组)
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &descriptorSets[currentFrame], 0, nullptr);
+        // 绘制命令（根据索引），函数结构：（命令缓冲，顶点数量，实例数量，索引的偏移量，顶点缓冲的偏移量，实例的偏移量）
+        vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
 
         // 结束渲染传递
         vkCmdEndRenderPass(commandBuffer);
@@ -1165,6 +1285,9 @@ private:
 
         // 等待上一帧完成之后，需要手动将栅栏信号重置为未发出信号的状态（如果重建了交换链，栅栏又会初始化成发出信号状态，所以需要在重建之后再重置栅栏，以避免死锁）
         vkResetFences(device, 1, &inFlightFences[currentFrame]);
+
+        // 更新uniform缓冲
+        updateUniformBuffer(currentFrame);
 
         // 3、记录命令缓冲
         vkResetCommandBuffer(commandBuffers[currentFrame],  0);// 先重置命令缓冲，以确保它能够被记录
@@ -1251,6 +1374,256 @@ private:
         }
         // 解除逻辑设备与交换链的联系，删除交换链
         vkDestroySwapchainKHR(device, swapChain, nullptr);
+    }
+
+    // 创建顶点缓冲，适用于顶点缓冲的最优内存类型具有DEVICE_LOCAL本地设备属性（应该是将数据传给了显存？）
+    void createVertexBuffer() {
+        // 缓冲大小与顶点数据大小相同
+        VkDeviceSize bufferSize = sizeof(vertices[0]) * vertices.size();
+
+        VkBuffer stagingBuffer;// 临时缓冲
+        VkDeviceMemory stagingBufferMemory;
+        // usage有两种：
+        // VK_BUFFER_USAGE_TRANSFER_SRC_BIT: 缓冲区可以用作内存传输操作中的源
+        // VK_BUFFER_USAGE_TRANSFER_DST_BIT: 缓冲区可以用作内存传输操作中的目标
+        // 使用主机可见缓冲区作为临时缓冲区stagingBuffer，properties项里面提到了主机HOST可见VISIBLE与关联COHERENT
+        createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
+
+        void* data;
+        vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);// 将内存进行映射
+        memcpy(data, vertices.data(), (size_t) bufferSize);// 将数据存入物理内存中
+        vkUnmapMemory(device, stagingBufferMemory);// 取消映射
+
+        // 使用设备本地缓冲区作为实际的顶点缓冲区vertexBuffer，properties项里面提到了设备本地DEVICE_LOCAL
+        // 设备本地的内存类型是无法使用vkMapMemory内存映射的，所以需要将数据从stagingBuffer复制到vertexBuffer
+        createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, vertexBuffer, vertexBufferMemory);
+
+        // 将顶点数据移动到设备本地缓冲区，将数据从stagingBuffer复制到vertexBuffer
+        copyBuffer(stagingBuffer, vertexBuffer, bufferSize);
+
+        // 完成转移后，临时缓冲区stagingBuffer就完成了它的使命，可以删除了
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingBufferMemory, nullptr);
+    }
+
+    // 创建顶点索引缓冲，跟顶点缓冲一样，放入最优类型内存中
+    void createIndexBuffer() {
+        VkDeviceSize bufferSize = sizeof(indices[0]) * indices.size();
+
+        VkBuffer stagingBuffer;// 临时缓冲
+        VkDeviceMemory stagingBufferMemory;
+        createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
+
+        void* data;
+        vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);
+        memcpy(data, indices.data(), (size_t) bufferSize);
+        vkUnmapMemory(device, stagingBufferMemory);
+
+        // usage指定为INDEX_BUFFER
+        createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, indexBuffer, indexBufferMemory);
+
+        copyBuffer(stagingBuffer, indexBuffer, bufferSize);
+
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingBufferMemory, nullptr);
+    }
+
+    // 创建若干缓冲（前三个参数是输入，后两个参数是输出）
+    void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory) {
+        VkBufferCreateInfo bufferInfo{};
+        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufferInfo.size = size;// 指定缓冲区大小（字节为单位）
+        bufferInfo.usage = usage;// 指定用途，我们这里用作顶点缓冲区
+        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;// 跟交换链图像一样，缓冲区也可以指定队列族，我们这里指定图形队列的独占访问
+
+        if (vkCreateBuffer(device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create buffer!");
+        }
+
+        // 申请顶点缓冲的内存，包括合适的内存大小和类型
+        VkMemoryRequirements memRequirements;
+        vkGetBufferMemoryRequirements(device, buffer, &memRequirements);
+
+        VkMemoryAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memRequirements.size;
+        allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, properties);
+
+        // （需要改进）注意：其实我们不应该为每个单独的缓冲区实际调用vkAllocateMemory，因为它的最大分配数量会受到物理设备的限制
+        // 同时为大量对象分配内存的正确方法是创建一个自定义分配器，然后使用偏移参数，在许多不同对象之间拆分单个分配
+        if (vkAllocateMemory(device, &allocInfo, nullptr, &bufferMemory) != VK_SUCCESS) {
+            throw std::runtime_error("failed to allocate buffer memory!");
+        }
+
+        // 将此内存与缓冲绑定
+        vkBindBufferMemory(device, buffer, bufferMemory, 0);
+    }
+
+    // 将一个缓冲区的数据复制到另一个缓冲区，内存传输操作使用命令缓冲区执行，就像绘制命令一样
+    void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size) {
+        // 首先分配一个临时命令缓冲区
+        VkCommandBufferAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocInfo.commandPool = commandPool;
+        allocInfo.commandBufferCount = 1;
+
+        VkCommandBuffer commandBuffer;
+        vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer);
+
+        // 开始记录命令缓冲区
+        VkCommandBufferBeginInfo beginInfo{};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;// 这里我们只使用一次命令缓冲区，所以用flag告诉驱动USAGE_ONE_TIME
+
+        vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+        VkBufferCopy copyRegion{};
+        copyRegion.size = size;
+        vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);// 缓冲区复制操作
+
+        // 记录完毕
+        vkEndCommandBuffer(commandBuffer);
+
+        // 执行命令缓冲区
+        VkSubmitInfo submitInfo{};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &commandBuffer;
+
+        vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+        vkQueueWaitIdle(graphicsQueue);// 等待转移完成
+
+        // 删除命令缓冲区
+        vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
+    }
+
+    // 查找合适的内存类型
+    uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) {
+        // 查找可用的内存类型
+        VkPhysicalDeviceMemoryProperties memProperties;
+        vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProperties);
+
+        for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
+            // typeFilter参数用位字段的形式表示了合适的内存类型
+            // 我们还需要保证该类型的内存能够将顶点数据写入该内存
+            if ((typeFilter & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
+                return i;
+            }
+        }
+        // 如果运行到这一步，说明没找到合适的内存类型，抛出异常
+        throw std::runtime_error("failed to find suitable memory type!");
+    }
+
+    // 创建描述符布局（shader中的全局变量）
+    void createDescriptorSetLayout() {
+        VkDescriptorSetLayoutBinding uboLayoutBinding{};
+        uboLayoutBinding.binding = 0;// 描述符的绑定
+        uboLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;// 指定描述符的类型，我们这里指定为Uniform
+        uboLayoutBinding.descriptorCount = 1;// 指定数组中的值的数量（我们的模型、视角、投影矩阵转换是在单个统一缓冲区对象中，所以值为1）
+
+        uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;// 指定描述符在着色器的哪个阶段被引用，这里我们指定为顶点着色器
+        uboLayoutBinding.pImmutableSamplers = nullptr; // 图像采样相关参数，这里我们不指定
+
+        VkDescriptorSetLayoutCreateInfo layoutInfo{};
+        layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        layoutInfo.bindingCount = 1;
+        layoutInfo.pBindings = &uboLayoutBinding;
+
+        if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &descriptorSetLayout) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create descriptor set layout!");
+        }
+    }
+
+    // 创建uniform缓冲
+    void createUniformBuffers() {
+        VkDeviceSize bufferSize = sizeof(UniformBufferObject);
+
+        uniformBuffers.resize(MAX_FRAMES_IN_FLIGHT);
+        uniformBuffersMemory.resize(MAX_FRAMES_IN_FLIGHT);
+        uniformBuffersMapped.resize(MAX_FRAMES_IN_FLIGHT);
+
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            createBuffer(bufferSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, uniformBuffers[i], uniformBuffersMemory[i]);
+
+            vkMapMemory(device, uniformBuffersMemory[i], 0, bufferSize, 0, &uniformBuffersMapped[i]);
+        }
+    }
+
+    // 更新uniform缓冲
+    void updateUniformBuffer(uint32_t currentImage) {
+        // 根据时间来计算旋转角度（例如每秒转90度），使转速与时间绑定，而不是跟帧刷新率绑定
+        static auto startTime = std::chrono::high_resolution_clock::now();
+
+        auto currentTime = std::chrono::high_resolution_clock::now();
+        float time = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
+
+        UniformBufferObject ubo{};
+        // 模型矩阵，每秒沿着z轴转90度，函数结构：旋转(原矩阵, 旋转角度, 旋转轴方向)
+        ubo.model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+        // 视角矩阵，函数结构：观察(观察点位置, 看向的中心位置, 摄像机"向上"的方向（一般世界以z轴正坐标作为上方向）)
+        ubo.view = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+        // 投影矩阵，它可以矫正窗口的纵横比，图像不再因为窗口的纵横比而拉伸，函数结构：透视(fov, 长宽比, 近视屏幕, 远视平面)
+        ubo.proj = glm::perspective(glm::radians(45.0f), swapChainExtent.width / (float) swapChainExtent.height, 0.1f, 10.0f);
+        // 由于glm最初是为OpenGL设计的，所以其剪辑坐标的Y坐标是倒置的，需要将其Y坐标转过来
+        ubo.proj[1][1] *= -1;
+
+        // 内存映射
+        memcpy(uniformBuffersMapped[currentImage], &ubo, sizeof(ubo));
+    }
+
+    // 创建描述符池
+    void createDescriptorPool() {
+        VkDescriptorPoolSize poolSize{};
+        poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        poolSize.descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);// 数量与同时处理的帧数相同，描述符与帧一一对应
+
+        VkDescriptorPoolCreateInfo poolInfo{};
+        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolInfo.poolSizeCount = 1;
+        poolInfo.pPoolSizes = &poolSize;
+        poolInfo.maxSets = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);// 指定可以分配的描述符集的最大数量
+
+        if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create descriptor pool!");
+        }
+    }
+
+    // 创建描述符集
+    void createDescriptorSets() {
+        std::vector<VkDescriptorSetLayout> layouts(MAX_FRAMES_IN_FLIGHT, descriptorSetLayout);// 指定布局
+        VkDescriptorSetAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocInfo.descriptorPool = descriptorPool;// 指定描述池
+        allocInfo.descriptorSetCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);// 指定大小
+        allocInfo.pSetLayouts = layouts.data();// 指定数据
+
+        descriptorSets.resize(MAX_FRAMES_IN_FLIGHT);
+        if (vkAllocateDescriptorSets(device, &allocInfo, descriptorSets.data()) != VK_SUCCESS) {
+            throw std::runtime_error("failed to allocate descriptor sets!");
+        }
+
+        // 填充描述符集中的每一个描述符
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            VkDescriptorBufferInfo bufferInfo{};
+            bufferInfo.buffer = uniformBuffers[i];
+            bufferInfo.offset = 0;
+            bufferInfo.range = sizeof(UniformBufferObject);// 缓冲中包含描述符数据的区域
+
+            VkWriteDescriptorSet descriptorWrite{};
+            descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descriptorWrite.dstSet = descriptorSets[i];
+            descriptorWrite.dstBinding = 0;
+            descriptorWrite.dstArrayElement = 0;
+            descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;// 再次指定描述符类型
+            descriptorWrite.descriptorCount = 1;
+            descriptorWrite.pBufferInfo = &bufferInfo;// 由于我们的描述符使用缓冲的形式，所以在这里引用缓冲区数据的描述符
+            descriptorWrite.pImageInfo = nullptr; // Optional
+            descriptorWrite.pTexelBufferView = nullptr; // Optional
+
+            // 更新应用
+            vkUpdateDescriptorSets(device, 1, &descriptorWrite, 0, nullptr);
+        }
     }
 
 };
