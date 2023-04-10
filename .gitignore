@@ -1,2 +1,6 @@
 # 项目排除路径
 /cmake-build-debug/
+/cmake-build-release/
+
+.idea/
+.gitignore
